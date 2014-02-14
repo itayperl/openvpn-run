@@ -1,0 +1,159 @@
+#!/bin/bash
+
+USER=vpnuser
+# Set a custom homedir for the VPN user
+HOMEDIR="/home/$USER"
+# Allow the VPN user to connect to pulse audio
+ENABLE_PULSEAUDIO=1
+# Enable to run X11 programs (gives $USER access to the X server)
+ENABLE_X11=1
+# User allowed to connect to the X server and pulseaudio daemon. (The default is
+# to connect as root, which is not recommended and might not work at all.)
+X_USER=`whoami`
+
+fwmark=183
+table_id=183
+
+iptables_comment="vpn user rules, user=$USER fwmark=$fwmark"
+vpn_pw_url="http://www.vpnbook.com/freevpn"
+vpn_config_url="http://www.vpnbook.com/free-openvpn-account/VPNBook.com-OpenVPN-US1.zip"
+vpn_config_file="vpnbook-us1-tcp80.ovpn"
+
+get_script_path() {
+    # Returns the full path of this script. From http://stackoverflow.com/questions/4774054.
+    pushd `dirname "$0"` > /dev/null
+    echo `pwd`/`basename "$0"`
+    popd > /dev/null
+}
+
+create_user() {
+    if ! id "$USER" &>/dev/null; then
+        useradd "$USER" -s /bin/false -m -d "$HOMEDIR"
+    fi
+}
+
+cleanup_routing() {
+    ip route flush table "$table_id"
+    ip rule del table "$table_id" 2>/dev/null
+    iptables-save | grep -vF "$iptables_comment" | iptables-restore
+}
+
+setup_routing() {
+    cleanup_routing
+
+    # copy existing routes to custom table
+    ip route show | grep -v "^default" | while read rule; do
+        ip route add $rule table $table_id
+    done
+
+    # add VPN route
+    ip route add default via "$route_vpn_gateway" dev "$dev" table $table_id
+    ip route flush cache
+
+    # set up VPN routing for user
+    iptables -t mangle -A OUTPUT -m owner --uid-owner "$USER" -j MARK --set-mark "$fwmark" -m comment --comment "$iptables_comment"
+    iptables -t mangle -A PREROUTING -i tun3 -j MARK --set-mark "$fwmark" -m comment --comment "$iptables_comment"
+    iptables -t nat -A POSTROUTING -o tun3 -j SNAT --to-source "$ifconfig_local" -m comment --comment "$iptables_comment"
+    ip rule add fwmark "$fwmark" table "$table_id"
+
+    # Force the kernel to consider the fwmark when doing Reverse Path Filtering
+    # (without it incoming packets will be dropped, because RPF would check the 
+    # main routing table instead of $table_id. I'm not sure why this is off by
+    # default.)
+    sysctl -w net.ipv4.conf.${dev}.src_valid_mark=1
+}
+
+_start_vpn() {
+    local tempdir="$1"
+    curl -o "$tempdir/config.zip" "$vpn_config_url" || return
+    unzip -d "$tempdir" "$tempdir/config.zip" "$vpn_config_file" || return
+
+    local password=$(curl -s "$vpn_pw_url" | sed -r -n 's/.*Password:\s*<[^>]+>([^<]+).*/\1/ p' | head -1)
+
+    local options=(--config "$tempdir/$vpn_config_file" --writepid "$tempdir/pid" --daemon --route-noexec --route-up $(get_script_path) --script-security 2 --auth-user-pass)
+
+    if [ -z "$openvpn_supports_password_file" ]; then
+        expect -f - openvpn "${options[@]}" <<EOF
+spawn {*}\$argv
+expect "Enter Auth Username:"
+send "vpnbook\n"
+expect "Enter Auth Password:"
+send "$password\n"
+interact
+EOF
+    else
+        echo "vpnbook" > "$tempdir/auth"
+        chmod 600 "$tempdir/auth"
+        echo "$password" >> "$tempdir/auth"
+        openvpn "${options[@]}" "$tempdir/auth"
+    fi
+}
+
+exec 3>&1
+start_vpn() {
+    local tempdir=$(mktemp -d)
+    trap "rm -rf \"$tempdir\"" RETURN
+
+    _start_vpn "$tempdir" 1>&3
+
+    sleep 1
+    local pid=$(cat "$tempdir/pid" 2>/dev/null)
+    if [ -z $pid ]; then
+        return
+    fi
+
+    touch "$tempdir/vpn_is_up"
+    # this command will terminate when either the vpn comes up or openvpn dies.
+    tail -f "$tempdir/vpn_is_up" --pid $pid | head -n 0
+    ps -p$pid &>/dev/null || return
+    echo $pid
+}
+
+main() {
+    # In some distros, openvpn is compiled in a way that doesn't allow passing a 
+    # user/pass file on the command-line. In this case will have to use expect(1).
+    openvpn_supports_password_file=$(openvpn --version | grep -q "enable_password_save=yes" && echo 1)
+    if [ -z "$openvpn_supports_password_file" ] && ! which expect &> /dev/null; then
+        echo "Required dependency 'expect' is missing."
+        exit 1
+    fi
+
+    local openvpn_pid=$(start_vpn)
+    if [ -z "$openvpn_pid" ]; then
+        echo "VPN connection failed. Check syslog for details." >&2
+        exit 1
+    fi
+
+    [ "$ENABLE_X11" -eq 1 ] && sudo -u $X_USER xhost +SI:localuser:$USER
+
+    local pa_sock=
+    if [ "$ENABLE_PULSEAUDIO" -eq 1 ]; then
+        pa_sock=$(mktemp -u --suffix=.sock)
+        # FIXME Better to use an auth cookie
+        local module_id=$(sudo -u $X_USER pactl load-module module-native-protocol-unix socket="$pa_sock" auth-anonymous=1)
+        trap "sudo -u $X_USER pactl unload-module $module_id && rm $pa_sock" EXIT
+        chown "$USER" "$pa_sock"
+        chmod 600 "$pa_sock"
+    fi
+
+    # Run the command
+    sudo PULSE_SERVER=$pa_sock -Hu "$USER" "$@"
+    kill -TERM "$openvpn_pid"
+    cleanup_routing
+}
+
+route_up() {
+    # This part is executed by OpenVPN when the connnection is up
+    local tempdir="$(dirname "$config")"
+    local pid=$(cat "$tempdir/pid" 2>/dev/null)
+    trap "kill -TERM $pid" ERR
+    create_user
+    setup_routing
+    echo 1 >> "$tempdir/vpn_is_up"
+}
+
+if [ "$script_type" != "route-up" ]; then
+    main "$@"
+else
+    route_up
+fi
