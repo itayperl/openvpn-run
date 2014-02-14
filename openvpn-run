@@ -52,8 +52,8 @@ setup_routing() {
 
     # set up VPN routing for user
     iptables -t mangle -A OUTPUT -m owner --uid-owner "$USER" -j MARK --set-mark "$fwmark" -m comment --comment "$iptables_comment"
-    iptables -t mangle -A PREROUTING -i tun3 -j MARK --set-mark "$fwmark" -m comment --comment "$iptables_comment"
-    iptables -t nat -A POSTROUTING -o tun3 -j SNAT --to-source "$ifconfig_local" -m comment --comment "$iptables_comment"
+    iptables -t mangle -A PREROUTING -i "$dev" -j MARK --set-mark "$fwmark" -m comment --comment "$iptables_comment"
+    iptables -t nat -A POSTROUTING -o "$dev" -j SNAT --to-source "$ifconfig_local" -m comment --comment "$iptables_comment"
     ip rule add fwmark "$fwmark" table "$table_id"
 
     # Force the kernel to consider the fwmark when doing Reverse Path Filtering
